@@ -67,7 +67,7 @@ conda install pytorch==1.4.0 torchvision==0.5.0 cudatoolkit=10.0 -c pytorch
 
 # install apex
 cd Oscar  # cd back to the root of the Oscar repo
-git clone https://github.com/NVIDIA/apex.git
+git clone https://github.com/NVIDIA/apex.git #@e2083df
 cd apex
 
 pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" .

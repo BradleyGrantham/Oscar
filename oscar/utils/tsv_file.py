@@ -18,7 +18,7 @@ def generate_lineidx(filein, idxout):
 
 
 class TSVFile(object):
-    def __init__(self, tsv_file, generate_lineidx=False):
+    def __init__(self, tsv_file, generate_lineidx__=False):
         self.tsv_file = tsv_file
         self.lineidx = op.splitext(tsv_file)[0] + '.lineidx'
         self._fp = None
@@ -27,7 +27,7 @@ class TSVFile(object):
         # If the pid is not equal to the currrent pid, we will re-open the file.
         self.pid = None
         # generate lineidx if not exist
-        if not op.isfile(self.lineidx) and generate_lineidx:
+        if not op.isfile(self.lineidx):
             generate_lineidx(self.tsv_file, self.lineidx)
 
     def __del__(self):

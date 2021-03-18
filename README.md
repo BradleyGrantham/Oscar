@@ -94,7 +94,7 @@ pip install -r requirements.txt
 pip install 'git+https://github.com/cocodataset/cocoapi.git#subdirectory=PythonAPI'
 
 # Install detectron2
-pip install -e .
+python setup.py build develop
 
 # or if you want to run on macOS
 # MACOSX_DEPLOYMENT_TARGET=10.9 CC=clang CXX=clang++ python setup.py build develop

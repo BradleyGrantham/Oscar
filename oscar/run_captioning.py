@@ -1,194 +1,290 @@
 # Copyright (c) 2020 Microsoft Corporation. Licensed under the MIT license.
-
+"""Extract the features needed to use Oscar."""
 from __future__ import absolute_import, division, print_function
+import os
+from io import BytesIO
+from itertools import zip_longest
 import argparse
 import base64
 import os.path as op
-import random, time, json
+import random
+from pprint import pprint
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
-from tqdm import tqdm
+from PIL import Image
 
 from oscar.utils.logger import setup_logger
-from oscar.utils.tsv_file import TSVFile
-from oscar.utils.tsv_file_ops import tsv_writer
-from oscar.utils.misc import (mkdir, set_seed, 
-        load_from_yaml_file, find_file_path_in_yaml)
-from oscar.utils.caption_evaluate import (evaluate_on_coco_caption,
-        evaluate_on_nocaps, ScstRewardCriterion)
-from oscar.utils.cbs import ConstraintFilter, ConstraintBoxesReader
-from oscar.utils.cbs import FiniteStateMachineBuilder
+from oscar.utils.misc import set_seed
 from oscar.modeling.modeling_bert import BertForImageCaptioning
 from transformers.pytorch_transformers import BertTokenizer, BertConfig
-from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
+from detectron2.engine import DefaultPredictor
+from detectron2.config import get_cfg
+from detectron2.modeling.postprocessing import detector_postprocess
+from detectron2.modeling.roi_heads.fast_rcnn import FastRCNNOutputs
+from detectron2.data import MetadataCatalog
+from torchvision.ops import nms
+from detectron2.structures import Boxes, Instances
 
 
-class CaptionTSVDataset(Dataset):
-    def __init__(self, yaml_file, tokenizer=None, add_od_labels=True,
-            max_img_seq_length=50, max_seq_length=70, max_seq_a_length=40, 
-            is_train=True, mask_prob=0.15, max_masked_tokens=3, **kwargs):
-        """Constructor.
-        Args:
-            yaml file with all required data (image feature, caption, labels, etc)
-            tokenizer: tokenizer for text processing.
-            add_od_labels: whether to add labels from yaml file to BERT. 
-            max_img_seq_length: max image sequence length.
-            max_seq_length: max text sequence length.
-            max_seq_a_length: max caption sequence length.
-            is_train: train or test mode.
-            mask_prob: probability to mask a input token.
-            max_masked_tokens: maximum number of tokens to be masked in one sentence.
-            kwargs: other arguments.
-        """
-        self.yaml_file = yaml_file
-        self.cfg = load_from_yaml_file(yaml_file)
-        self.root = op.dirname(yaml_file)
-        self.label_file = find_file_path_in_yaml(self.cfg['label'], self.root)
-        self.feat_file = find_file_path_in_yaml(self.cfg['feature'], self.root)
-        self.caption_file = find_file_path_in_yaml(self.cfg.get('caption'), self.root)
-
-        assert op.isfile(self.feat_file)
-        if add_od_labels: assert op.isfile(self.label_file)
-        if is_train: assert op.isfile(self.caption_file) and tokenizer is not None
-
-        self.label_tsv = None if not self.label_file else TSVFile(self.label_file)
-        self.feat_tsv = TSVFile(self.feat_file)
-        if self.caption_file and op.isfile(self.caption_file):
-            with open(self.caption_file, 'r') as f:
-                self.captions = json.load(f)
-
-        self.tokenizer = tokenizer
-        self.tensorizer = CaptionTensorizer(self.tokenizer, max_img_seq_length,
-                max_seq_length, max_seq_a_length, mask_prob, max_masked_tokens,
-                is_train=is_train)
-        self.add_od_labels = add_od_labels
-        self.is_train = is_train
-        self.kwargs = kwargs
-        self.image_keys = self.prepare_image_keys()
-        self.key2index = self.prepare_image_key_to_index()
-        self.key2captions = self.prepare_image_key_to_captions()
-
-    def get_valid_tsv(self):
-        # based on the order of file size
-        if self.label_tsv:
-            return self.label_tsv
-        if self.feat_tsv:
-            return self.feat_tsv
-
-    def prepare_image_keys(self):
-        tsv = self.get_valid_tsv()
-        return [tsv.seek(i)[0] for i in range(tsv.num_rows())]
-
-    def prepare_image_key_to_index(self):
-        tsv = self.get_valid_tsv()
-        return {tsv.seek(i)[0] : i for i in range(tsv.num_rows())}
-
-    def prepare_image_key_to_captions(self):
-        if self.is_train:
-            key2captions = {key: [] for key in self.image_keys}
-            for cap in self.captions:
-                key2captions[cap['image_id']].append(cap['caption'])
-            return key2captions
-
-    def get_image_index(self, idx):
-        if self.is_train:
-            img_cap_pair = self.captions[idx]
-            img_key = img_cap_pair['image_id']
-            return self.key2index[img_key]
-        return idx
-
-    def get_image_key(self, idx):
-        img_idx = self.get_image_index(idx)
-        return self.image_keys[img_idx]
-
-    def get_image_features(self, img_idx):
-        feat_info = json.loads(self.feat_tsv.seek(img_idx)[1])
-        num_boxes = feat_info['num_boxes']
-        features = np.frombuffer(base64.b64decode(feat_info['features']), np.float32
-                ).reshape((num_boxes, -1))
-        return torch.Tensor(features)
-
-    def get_caption(self, idx):
-        if self.is_train:
-            img_cap_pair = self.captions[idx]
-            return img_cap_pair['caption']
-        return ""
-
-    def get_od_labels(self, img_idx):
-        od_labels = None
-        if self.add_od_labels:
-            label_info = json.loads(self.label_tsv.seek(img_idx)[1])
-            od_labels = " ".join([l['class'] for l in label_info])
-        return od_labels
-
-    def get_caption_file_in_coco_format(self):
-        cap_file = op.splitext(self.caption_file)[0] + '_coco_format.json'
-        return cap_file
-
-    def get_captions_by_key(self, key):
-        assert self.is_train, "cannot get captions for inference"
-        return self.key2captions[key]
-
-    def __getitem__(self, idx):
-        img_idx = self.get_image_index(idx)
-        img_key = self.image_keys[img_idx]
-        features = self.get_image_features(img_idx)
-        caption = self.get_caption(idx)
-        od_labels = self.get_od_labels(img_idx)
-        example = self.tensorizer.tensorize_example(caption, features, text_b=od_labels)
-        return img_key, example
-
-    def __len__(self):
-        if self.is_train:
-            return len(self.captions)
-        return self.get_valid_tsv().num_rows()
+IMAGE_PATH = "/home/ubuntu/my-images/68b51467-19a3-4b41-ad51-c7054ebf84ae.JPG"
+PACKAGE_LOCATION = "/home/ubuntu/py-bottom-up-attention"
+D2_ROOT = op.join(
+    PACKAGE_LOCATION, "detectron2/model_zoo/"
+)  # Root of detectron2
+MIN_BOXES = 36
+MAX_BOXES = 36
 
 
-class CaptionTSVDatasetWithConstraints(CaptionTSVDataset):
-    r"""
-    Providing inputs for inference with Constraint Beam Search
+def convert_image_to_b64(image_path):
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode()
 
-    nms_threshold: float, optional (default = 0.85)
-        NMS threshold for suppressing generic object class names during constraint filtering,
-        for two boxes with IoU higher than this threshold, "dog" suppresses "animal".
-    max_given_constraints: int, optional (default = 3)
-        Maximum number of constraints which can be specified for CBS decoding. Constraints are
-        selected based on the prediction confidence score of their corresponding bounding boxes.
-    """
+    return encoded_string
 
-    def __init__(
-        self, yaml_file,
-        nms_threshold=0.85,
-        max_given_constraints=3, **kwargs
-    ):
-        super().__init__(yaml_file, **kwargs)
-        boxes_tsvpath = find_file_path_in_yaml(self.cfg['cbs_box'], self.root)
-        constraint2tokens_tsvpath = find_file_path_in_yaml(self.cfg['cbs_constraint'], self.root)
-        tokenforms_tsvpath = find_file_path_in_yaml(self.cfg['cbs_tokenforms'], self.root)
-        hierarchy_jsonpath = find_file_path_in_yaml(self.cfg['cbs_hierarchy'], self.root)
 
-        self._boxes_reader = ConstraintBoxesReader(boxes_tsvpath)
-        self._constraint_filter = ConstraintFilter(
-            hierarchy_jsonpath, nms_threshold, max_given_constraints
+def convert_b64_to_image(s):
+    r = base64.b64decode(s)
+    file_like = BytesIO(r)
+    im = np.array(Image.open(file_like))
+    return im
+
+
+def grouper(iterable, n, fillvalue=None):
+    args = [iter(iterable)] * n
+    return zip_longest(*args, fillvalue=fillvalue)
+
+
+def fast_rcnn_inference_single_image(
+        boxes,
+        scores,
+        image_shape,
+        score_thresh,
+        nms_thresh,
+        topk_per_image,
+        cuda=True,
+):
+    scores = scores[:, :-1]
+    num_bbox_reg_classes = boxes.shape[1] // 4
+    # Convert to Boxes to use the `clip` function ...
+    boxes = Boxes(boxes.reshape(-1, 4))
+    boxes.clip(image_shape)
+    boxes = boxes.tensor.view(-1, num_bbox_reg_classes, 4)  # R x C x 4
+
+    # Select max scores
+    max_scores, max_classes = scores.max(1)  # R x C --> R
+    num_objs = boxes.size(0)
+    boxes = boxes.view(-1, 4)
+    if cuda:
+        torcharange = torch.arange(num_objs).cuda()
+    else:
+        torcharange = torch.arange(num_objs)
+
+    idxs = torcharange * num_bbox_reg_classes + max_classes
+    max_boxes = boxes[idxs]  # Select max boxes according to the max scores.
+
+    # Apply NMS
+    keep = nms(max_boxes, max_scores, nms_thresh)
+    if topk_per_image >= 0:
+        keep = keep[:topk_per_image]
+    boxes, scores = max_boxes[keep], max_scores[keep]
+
+    result = Instances(image_shape)
+    result.pred_boxes = Boxes(boxes)
+    result.scores = scores
+    result.pred_classes = max_classes[keep]
+
+    return result, keep
+
+
+def doit(detector, raw_images, cuda=True):
+    with torch.no_grad():
+        # Preprocessing
+        inputs = []
+        for raw_image in raw_images:
+            image = detector.transform_gen.get_transform(
+                raw_image
+            ).apply_image(raw_image)
+            image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+            inputs.append(
+                {
+                    "image": image,
+                    "height": raw_image.shape[0],
+                    "width": raw_image.shape[1],
+                }
+            )
+        images = detector.model.preprocess_image(inputs)
+
+        # Run Backbone Res1-Res4
+        features = detector.model.backbone(images.tensor)
+
+        # Generate proposals with RPN
+        proposals, _ = detector.model.proposal_generator(
+            images, features, None
         )
-        self._fsm_builder = FiniteStateMachineBuilder(self.tokenizer,
-                constraint2tokens_tsvpath, tokenforms_tsvpath,
-                max_given_constraints)
 
-    def __getitem__(self, index):
-        img_key, example = super().__getitem__(index)
-
-        # Apply constraint filtering to object class names.
-        constraint_boxes = self._boxes_reader[img_key]
-
-        candidates = self._constraint_filter(
-            constraint_boxes["boxes"], constraint_boxes["class_names"], constraint_boxes["scores"]
+        # Run RoI head for each proposal (RoI Pooling + Res5)
+        proposal_boxes = [x.proposal_boxes for x in proposals]
+        features = [features[f] for f in detector.model.roi_heads.in_features]
+        box_features = detector.model.roi_heads._shared_roi_transform(
+            features, proposal_boxes
         )
-        num_constraints = len(candidates)
-        fsm, nstates = self._fsm_builder.build(candidates)
+        feature_pooled = box_features.mean(
+            dim=[2, 3]
+        )  # (sum_proposals, 2048), pooled to 1x1
 
-        return img_key, example + (fsm, num_constraints, )
+        # Predict classes and boxes for each proposal.
+        (
+            pred_class_logits,
+            pred_proposal_deltas,
+        ) = detector.model.roi_heads.box_predictor(feature_pooled)
+        rcnn_outputs = FastRCNNOutputs(
+            detector.model.roi_heads.box2box_transform,
+            pred_class_logits,
+            pred_proposal_deltas,
+            proposals,
+            detector.model.roi_heads.smooth_l1_beta,
+        )
+
+        # Fixed-number NMS
+        instances_list, ids_list = [], []
+        probs_list = rcnn_outputs.predict_probs()
+        boxes_list = rcnn_outputs.predict_boxes()
+        for probs, boxes, image_size in zip(
+                probs_list, boxes_list, images.image_sizes
+        ):
+            for nms_thresh in np.arange(0.3, 1.0, 0.1):
+                instances, ids = fast_rcnn_inference_single_image(
+                    boxes,
+                    probs,
+                    image_size,
+                    score_thresh=0.2,
+                    nms_thresh=nms_thresh,
+                    topk_per_image=MAX_BOXES,
+                    cuda=cuda,
+                )
+                if len(ids) >= MIN_BOXES:
+                    break
+            instances_list.append(instances)
+            ids_list.append(ids)
+
+        # Post processing for features
+        features_list = feature_pooled.split(
+            rcnn_outputs.num_preds_per_image
+        )  # (sum_proposals, 2048) --> [(p1, 2048), (p2, 2048), ..., (pn, 2048)]
+        roi_features_list = []
+        for ids, features in zip(ids_list, features_list):
+            roi_features_list.append(features[ids].detach())
+
+        # Post processing for bounding boxes (rescale to raw_image)
+        raw_instances_list = []
+        for instances, input_per_image, image_size in zip(
+                instances_list, inputs, images.image_sizes
+        ):
+            height = input_per_image.get("height", image_size[0])
+            width = input_per_image.get("width", image_size[1])
+
+            # we pass the height and width in as 1 so we get proportional heights and widths rather than raw numbers
+            raw_instances = detector_postprocess(instances, 1, 1)
+            raw_instances_list.append(raw_instances)
+
+        return raw_instances_list, roi_features_list
+
+
+def load_vg_classes():
+    # Load VG Classes
+    data_path = os.path.join(PACKAGE_LOCATION, "demo/data/genome/1600-400-20")
+
+    vg_classes = []
+    with open(os.path.join(data_path, "objects_vocab.txt")) as f:
+        for object in f.readlines():
+            vg_classes.append(object.split(",")[0].lower().strip())
+
+        MetadataCatalog.get("vg").thing_classes = vg_classes
+    class_names = MetadataCatalog.get("vg").as_dict()["thing_classes"]
+
+    return class_names
+
+
+def create_embeddings(detector, pathXid, cuda=True):
+    imgs, img_ids = zip(*pathXid)
+
+    instances_list, features_list = doit(detector, imgs, cuda)
+
+    class_names = load_vg_classes()
+
+    for img, image_id, instances, features in zip(imgs, img_ids, instances_list, features_list):
+
+        boxes = instances.pred_boxes.tensor.to("cpu").numpy()
+        preds = instances.scores.to("cpu").numpy()
+        clses = instances.pred_classes.to("cpu").numpy()
+        num_bboxes = boxes.shape[0]
+        boxes_with_height_and_width = np.concatenate(
+            (
+                boxes,
+                (boxes[:, 2] - boxes[:, 0])[:, np.newaxis],
+                (boxes[:, 3] - boxes[:, 1])[:, np.newaxis],
+            ),
+            axis=1,
+        )
+
+        resnet_embeddings = features.to("cpu").numpy()
+
+        embeddings_for_oscar = np.concatenate(
+            (resnet_embeddings, boxes_with_height_and_width), axis=1
+        )
+
+    embeddings_for_oscar = torch.from_numpy(embeddings_for_oscar).to("cpu")
+    if cuda:
+        embeddings_for_oscar = embeddings_for_oscar.cuda()
+
+    return embeddings_for_oscar, " ".join([class_names[id_] for id_ in clses])
+
+
+def load_image_ids(img_root):
+    """images in the same directory are in the same split"""
+    paths_and_ids = []
+    for name in os.listdir(img_root):
+        idx = name.split(".")[0]
+        paths_and_ids.append((os.path.join(img_root, name), idx))
+    return paths_and_ids
+
+
+def build_model(cuda=False):
+    """Build model and load weights for vg only."""
+    cfg = get_cfg()  # Renew the cfg file
+    cfg.merge_from_file(
+        os.path.join(
+            D2_ROOT,
+            "configs/VG-Detection/faster_rcnn_R_101_C4_caffemaxpool.yaml",
+        )
+    )
+    cfg.MODEL.RPN.POST_NMS_TOPK_TEST = 300
+    cfg.MODEL.ROI_HEADS.NMS_THRESH_TEST = 0.6
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.2
+    cfg.INPUT.MIN_SIZE_TEST = 600
+    cfg.INPUT.MAX_SIZE_TEST = 1000
+    cfg.MODEL.RPN.NMS_THRESH = 0.7
+    # Find a model from detectron2's model zoo. You can either use the https://dl.fbaipublicfiles.... url, or use the following shorthand
+    cfg.MODEL.WEIGHTS = (
+        "http://nlp.cs.unc.edu/models/faster_rcnn_from_caffe.pkl"
+    )
+
+    if not cuda:
+        cfg.DEVICE = "cpu"
+        cfg.MODEL.DEVICE = "cpu"
+    detector = DefaultPredictor(cfg)
+    return detector
+
+
+def extract_oscar_features(image_path, cuda):
+    b = convert_image_to_b64(image_path)
+    image = convert_b64_to_image(b)
+    detector = build_model(cuda)
+    a, b = create_embeddings(
+        detector, [(image, 0)], cuda
+    )
+    return a, b
 
 
 class CaptionTensorizer(object):
@@ -316,294 +412,11 @@ class CaptionTensorizer(object):
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         segment_ids = torch.tensor(segment_ids, dtype=torch.long)
 
-        if self.is_train:
-            masked_ids = torch.tensor(masked_ids, dtype=torch.long)
-            return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, masked_ids)
-        return (input_ids, attention_mask, segment_ids, img_feat, masked_pos)
+        return input_ids.cuda(), attention_mask.cuda(), segment_ids.cuda(), img_feat.cuda(), masked_pos.cuda()
 
 
-def build_dataset(yaml_file, tokenizer, args, is_train=True):
-    if not op.isfile(yaml_file):
-        yaml_file = op.join(args.data_dir, yaml_file)
-        assert op.isfile(yaml_file)
-
-    if is_train:
-        return CaptionTSVDataset(yaml_file, tokenizer=tokenizer,
-            add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
-            max_seq_length=args.max_seq_length, max_seq_a_length=args.max_seq_a_length,
-            is_train=True, mask_prob=args.mask_prob, max_masked_tokens=args.max_masked_tokens)
-    if args.use_cbs:
-        dataset_class = CaptionTSVDatasetWithConstraints
-    else:
-        dataset_class = CaptionTSVDataset
-    return dataset_class(yaml_file, tokenizer=tokenizer,
-            add_od_labels=args.add_od_labels, max_img_seq_length=args.max_img_seq_length,
-            max_seq_length=args.max_seq_length, max_seq_a_length=args.max_gen_length,
-            is_train=False)
-
-
-def save_checkpoint(model, tokenizer, args, epoch, global_step):
-    checkpoint_dir = op.join(args.output_dir, 'checkpoint-{}-{}'.format(
-        epoch, global_step))
-    mkdir(checkpoint_dir)
-    model_to_save = model.module if hasattr(model, 'module') else model 
-    save_num = 0
-    while (save_num < 10):
-        try:
-            model_to_save.save_pretrained(checkpoint_dir)
-            torch.save(args, op.join(checkpoint_dir, 'training_args.bin'))
-            tokenizer.save_pretrained(checkpoint_dir)
-            logger.info("Save checkpoint to {}".format(checkpoint_dir))
-            break
-        except:
-            save_num += 1
-    if save_num == 10:
-        logger.info("Failed to save checkpoint after 10 trails.")
-    return checkpoint_dir
-
-
-def compute_score_with_logits(logits, labels):
-    logits = torch.max(logits, -1)[1].data # argmax
-    scores = logits == labels 
-    return scores
-
-
-def train(args, train_dataset, val_dataset, model, tokenizer):
-    args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-    train_sampler = RandomSampler(train_dataset) 
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, 
-            batch_size=args.train_batch_size, num_workers=args.num_workers)
-
-    if args.max_steps > 0:
-        t_total = args.max_steps
-        args.num_train_epochs = args.max_steps // (len(train_dataloader) // \
-                args.gradient_accumulation_steps) + 1
-    else:
-        t_total = len(train_dataloader) // args.gradient_accumulation_steps \
-                * args.num_train_epochs
-
-    # Prepare optimizer and scheduler
-    no_decay = ['bias', 'LayerNorm.weight']
-    grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if not \
-            any(nd in n for nd in no_decay)], 'weight_decay': args.weight_decay},
-        {'params': [p for n, p in model.named_parameters() if \
-            any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    ]
-    optimizer = AdamW(grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
-    if args.scheduler == "constant":
-        scheduler = WarmupConstantSchedule(
-                optimizer, warmup_steps=args.warmup_steps)
-    elif args.scheduler == "linear":
-        scheduler = WarmupLinearSchedule(
-                optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
-    else:
-        raise ValueError("Unknown scheduler type: {}".format(args.scheduler))
-
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
-
-    logger.info("***** Running training *****")
-    logger.info("  Num examples = %d", len(train_dataset))
-    logger.info("  Num Epochs = %d", args.num_train_epochs)
-    logger.info("  Batch size per GPU = %d", args.per_gpu_train_batch_size)
-    logger.info("  Total train batch size (w. parallel, & accumulation) = %d",
-                   args.train_batch_size * args.gradient_accumulation_steps)
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
-    logger.info("  Total optimization steps = %d", t_total)
-
-    if args.scst:
-        scst_criterion = ScstRewardCriterion()
-        logger.info("  SCST training...")
-
-    global_step, global_loss, global_acc =0,  0.0, 0.0
-    model.zero_grad()
-    eval_log = []
-    best_score = 0
-    for epoch in range(int(args.num_train_epochs)):
-        for step, (img_keys, batch) in enumerate(train_dataloader):
-            batch = tuple(t.to(args.device) for t in batch)
-
-            if not args.scst:
-                model.train()
-                inputs = {'input_ids': batch[0], 'attention_mask': batch[1],
-                    'token_type_ids': batch[2], 'img_feats': batch[3], 
-                    'masked_pos': batch[4], 'masked_ids': batch[5]
-                }
-                outputs = model(**inputs)
-                loss, logits = outputs[:2]
-                masked_ids = inputs['masked_ids']
-                masked_ids = masked_ids[masked_ids != 0]
-                batch_score = compute_score_with_logits(logits, masked_ids)
-                batch_acc = torch.sum(batch_score.float()) / torch.sum(inputs['masked_pos'])
-            else:
-                loss = scst_train_iter(args, train_dataset, model, scst_criterion, img_keys, batch, tokenizer)
-                batch_acc = scst_criterion.get_score()
-
-            if args.n_gpu > 1: 
-                loss = loss.mean() # mean() to average on multi-gpu parallel training
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            global_loss += loss.item()
-            global_acc += batch_acc
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                global_step += 1
-                scheduler.step()
-                optimizer.step()
-                model.zero_grad()
-                if global_step % args.logging_steps == 0:
-                    logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f} ({:.4f}), " \
-                        "score: {:.4f} ({:.4f})".format(epoch, global_step, 
-                        optimizer.param_groups[0]["lr"], loss, global_loss / global_step, 
-                        batch_acc, global_acc / global_step)
-                    )
-
-                if (args.save_steps > 0 and global_step % args.save_steps == 0) or \
-                        global_step == t_total:
-                    checkpoint_dir = save_checkpoint(model, tokenizer, args, epoch, global_step) 
-                    # evaluation
-                    if args.evaluate_during_training: 
-                        logger.info("Perform evaluation at step: %d" % (global_step))
-                        evaluate_file = evaluate(args, val_dataset, model, tokenizer,
-                                checkpoint_dir)
-                        with open(evaluate_file, 'r') as f:
-                            res = json.load(f)
-                        best_score = max(best_score, res['CIDEr'])
-                        res['epoch'] = epoch
-                        res['global_step'] = step
-                        res['best_CIDEr'] = best_score
-                        eval_log.append(res)
-                        with open(args.output_dir + '/eval_logs.json', 'w') as f:
-                            json.dump(eval_log, f)
-    return global_step, global_loss / global_step
-
-
-def scst_train_iter(args, train_dataset, model, scst_criterion, img_keys, batch, tokenizer):
-    cls_token_id, sep_token_id, pad_token_id, mask_token_id = tokenizer.convert_tokens_to_ids(
-            [tokenizer.cls_token, tokenizer.sep_token, tokenizer.pad_token,
-                tokenizer.mask_token]
-            )
-    inputs = {'is_decode': True,
-        'input_ids': batch[0], 'attention_mask': batch[1],
-        'token_type_ids': batch[2], 'img_feats': batch[3],
-        'masked_pos': batch[4],
-        'do_sample': False,
-        'bos_token_id': cls_token_id,
-        'pad_token_id': pad_token_id,
-        'eos_token_ids': [sep_token_id, pad_token_id],
-        'mask_token_id': mask_token_id,
-        # for adding od labels
-        'add_od_labels': args.add_od_labels, 'od_labels_start_posid': args.max_seq_a_length,
-
-        # hyperparameters of beam search
-        'max_length': args.max_seq_a_length,
-        'num_beams': 1,
-        "temperature": args.temperature,
-        "top_k": args.top_k,
-        "top_p": args.top_p,
-        "repetition_penalty": args.repetition_penalty,
-        "length_penalty": args.length_penalty,
-        "num_return_sequences": 1,
-        "num_keep_best": 1,
-    }
-
-    model.eval()
-    with torch.no_grad():
-        greedy_res_raw, _ = model(**inputs)
-        greedy_res_raw.squeeze_(1)  # batch_size * max_len
-
-    model.train()
-    inputs['do_sample'] = True
-    sample_res_raw, sample_logprobs = model(**inputs)
-    sample_res_raw.squeeze_(1)
-    sample_logprobs.squeeze_(1)
-    assert sample_logprobs.requires_grad == True
-    assert sample_res_raw.requires_grad == False
-
-    def _ids_to_captions(all_ids):
-        captions = []
-        for ids in all_ids:
-            c = tokenizer.decode(ids.tolist(), skip_special_tokens=True)
-            captions.append(c)
-        return captions
-
-    greedy_res = _ids_to_captions(greedy_res_raw)
-    sample_res = _ids_to_captions(sample_res_raw)
-    gt_res = [train_dataset.get_captions_by_key(k) for k in img_keys]
-
-    loss = scst_criterion(gt_res, greedy_res, sample_res, sample_logprobs)
-    return loss
-
-
-def get_predict_file(output_dir, yaml_file, args):
-    cc = ['pred']
-    # make sure it works with/without / in end of the path.
-    data = op.basename(op.join(args.data_dir, '')[:-1])
-    split = op.basename(yaml_file)
-    assert split.endswith('.yaml')
-    split = split[:-5]
-    cc.append(data)
-    cc.append(split)
-    cc.append('beam{}'.format(args.num_beams))
-    cc.append('max{}'.format(args.max_gen_length))
-    if args.add_od_labels:
-        cc.append('odlabels')
-    if args.num_keep_best != 1:
-        cc.append('best{}'.format(args.num_keep_best))
-    if args.use_cbs:
-        cc.append('cbs{}'.format(args.min_constraints_to_satisfy))
-    if args.output_hidden_states:
-        cc.append('hidden')
-    return op.join(output_dir, '{}.tsv'.format('.'.join(cc)))
-
-
-def get_evaluate_file(predict_file):
-    assert predict_file.endswith('.tsv')
-    fpath = op.splitext(predict_file)[0]
-    return fpath + '.eval.json'
-
-
-def get_evaluate_method(predict_file):
-    if 'nocaps' in op.basename(predict_file):
-        return 'nocaps'
-    else:
-        return 'coco'
-
-
-def evaluate(args, val_dataset, model, tokenizer, output_dir):
-    assert op.isdir(output_dir)
-    predict_file = get_predict_file(output_dir, val_dataset.yaml_file, args)
-    if op.isfile(predict_file):
-        logger.info('Skip predict. {} already exists'.format(predict_file))
-    else:
-        test(args, val_dataset, model, tokenizer, predict_file)
-
-    evaluate_file = get_evaluate_file(predict_file)
-    if op.isfile(evaluate_file):
-        logger.info('Skip evaluation. {} already exists'.format(evaluate_file))
-        return evaluate_file
-
-    eval_method = get_evaluate_method(predict_file)
-    if eval_method == 'coco':
-        gt_file = val_dataset.get_caption_file_in_coco_format()
-        result = evaluate_on_coco_caption(predict_file, gt_file, outfile=evaluate_file)
-    else:
-        split = 'val' if 'val' in op.basename(val_dataset.yaml_file) else 'test'
-        result = evaluate_on_nocaps(split, predict_file, 
-                    data_dir=args.data_dir, evaluate_file=evaluate_file)
-    logger.info("evaluation result: {}".format(str(result)))
-    return evaluate_file
-
-
-def test(args, test_dataset, model, tokenizer, predict_file):
+def test(args, image_features, object_tags, model, tokenizer):
     args.test_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    test_sampler = SequentialSampler(test_dataset)
-    cache_file = predict_file
-
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler,
-            batch_size=args.test_batch_size, num_workers=args.num_workers)
 
     cls_token_id, sep_token_id, pad_token_id, mask_token_id, period_token_id = \
         tokenizer.convert_tokens_to_ids( [tokenizer.cls_token, 
@@ -611,79 +424,49 @@ def test(args, test_dataset, model, tokenizer, predict_file):
         )
     model.eval()
 
-    def gen_rows():
-        time_meter = 0
-        # restore existing results for long running inference tasks
-        exist_key2pred = {}
-        tmp_file = cache_file + '.tmp.copy'
-        if op.isfile(tmp_file):
-            with open(tmp_file, 'r') as fp:
-                for line in fp:
-                    parts = line.strip().split('\t')
-                    if len(parts) == 2:
-                        exist_key2pred[parts[0]] = parts[1]
+    tensorizer = CaptionTensorizer(tokenizer, 50, 50, 20, 0.15, 3, is_train=False)
+    input_ids, attention_mask, segment_ids, img_feat, masked_pos = tensorizer.tensorize_example(
+        text_a="", img_feat=image_features, text_b=object_tags
+    )
 
-        with torch.no_grad():
-            for step, (img_keys, batch) in tqdm(enumerate(test_dataloader)):
-                is_exist = True
-                for k in img_keys:
-                    if k not in exist_key2pred:
-                        is_exist = False
-                        break
-                if is_exist:
-                    for k in img_keys:
-                        yield k, exist_key2pred[k]
-                    continue
-                batch = tuple(t.to(args.device) for t in batch)
-                inputs = {'is_decode': True,
-                    'input_ids': batch[0], 'attention_mask': batch[1],
-                    'token_type_ids': batch[2], 'img_feats': batch[3],
-                    'masked_pos': batch[4],
-                    'do_sample': False,
-                    'bos_token_id': cls_token_id,
-                    'pad_token_id': pad_token_id,
-                    'eos_token_ids': [sep_token_id, pad_token_id],
-                    'mask_token_id': mask_token_id,
-                    # for adding od labels
-                    'add_od_labels': args.add_od_labels, 'od_labels_start_posid': args.max_seq_a_length,
+    with torch.no_grad():
+        inputs = {'is_decode': True,
+                  'input_ids': input_ids[None, :], 'attention_mask': attention_mask[None, :, :],
+                  'token_type_ids': segment_ids[None, :], 'img_feats': img_feat[None, :, :],
+                  'masked_pos': masked_pos[None, :],
+                  'do_sample': False,
+                  'bos_token_id': cls_token_id,
+                  'pad_token_id': pad_token_id,
+                  'eos_token_ids': [sep_token_id, pad_token_id],
+                  'mask_token_id': mask_token_id,
+                  # for adding od labels
+                  'add_od_labels': args.add_od_labels, 'od_labels_start_posid': args.max_seq_a_length,
 
-                    # hyperparameters of beam search
-                    'max_length': args.max_gen_length,
-                    'num_beams': args.num_beams,
-                    "temperature": args.temperature,
-                    "top_k": args.top_k,
-                    "top_p": args.top_p,
-                    "repetition_penalty": args.repetition_penalty,
-                    "length_penalty": args.length_penalty,
-                    "num_return_sequences": args.num_return_sequences,
-                    "num_keep_best": args.num_keep_best,
-                }
-                if args.use_cbs:
-                    inputs.update({'use_cbs': True,
-                        'fsm': batch[5],
-                        'num_constraints': batch[6],
-                        'min_constraints_to_satisfy': args.min_constraints_to_satisfy,
-                    })
-                tic = time.time()
-                # captions, logprobs
-                outputs = model(**inputs)
-                time_meter += time.time() - tic
-                all_caps = outputs[0]  # batch_size * num_keep_best * max_len
-                all_confs = torch.exp(outputs[1])
+                  # hyperparameters of beam search
+                  'max_length': args.max_gen_length,
+                  'num_beams': args.num_beams,
+                  "temperature": args.temperature,
+                  "top_k": args.top_k,
+                  "top_p": args.top_p,
+                  "repetition_penalty": args.repetition_penalty,
+                  "length_penalty": args.length_penalty,
+                  "num_return_sequences": args.num_return_sequences,
+                  "num_keep_best": 8,
+                  }
+        pprint(inputs)
+        # captions, logprobs
+        outputs = model(**inputs)
+        all_caps = outputs[0]  # batch_size * num_keep_best * max_len
+        all_confs = torch.exp(outputs[1])
 
-                for img_key, caps, confs in zip(img_keys, all_caps, all_confs):
-                    res = []
-                    for cap, conf in zip(caps, confs):
-                        cap = tokenizer.decode(cap.tolist(), skip_special_tokens=True)
-                        res.append({'caption': cap, 'conf': conf.item()})
-                    if isinstance(img_key, torch.Tensor):
-                        img_key = img_key.item()
-                    yield img_key, json.dumps(res)
-
-        logger.info("Inference model computing time: {} seconds per batch".format(time_meter / (step+1)))
-
-    tsv_writer(gen_rows(), cache_file)
-    return predict_file
+        captions = []
+        for cap, conf in zip(all_caps[0], all_confs[0]):
+            captions.append(
+                {"caption": tokenizer.decode(cap.tolist(), skip_special_tokens=True),
+                 "conf": conf.item()
+                 }
+            )
+        return captions
 
 
 def restore_training_settings(args):
@@ -714,19 +497,9 @@ def restore_training_settings(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", default='datasets/coco_caption', type=str, required=False,
-                        help="The input data dir with all required files.")
-    parser.add_argument("--train_yaml", default='train.yaml', type=str, required=False, 
-                        help="yaml file for training.")
-    parser.add_argument("--test_yaml", default='test.yaml', type=str, required=False,
-                        help="yaml file for testing.")
-    parser.add_argument("--val_yaml", default='val.yaml', type=str, required=False, 
-                        help="yaml file used for validation during training.")
     parser.add_argument("--model_name_or_path", default=None, type=str, required=False,
                         help="Path to pre-trained model or model type.")
-    parser.add_argument("--output_dir", default='output/', type=str, required=False,
-                        help="The output directory to save checkpoint and test results.")
-    parser.add_argument("--loss_type", default='sfmx', type=str, 
+    parser.add_argument("--loss_type", default='sfmx', type=str,
                         help="Loss function types: support kl, x2, sfmx")
     parser.add_argument("--config_name", default="", type=str, 
                         help="Pretrained config name or path if not the same as model_name.")
@@ -816,67 +589,36 @@ def main():
 
     global logger
 
+    logger = setup_logger("vlpretrain", "/home/ubuntu/", 0)
+
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
-    
-    output_dir = args.output_dir
-    mkdir(output_dir)
 
-    logger = setup_logger("vlpretrain", output_dir, 0)
     logger.warning("Device: %s, n_gpu: %s", args.device, args.n_gpu)
     set_seed(args.seed, args.n_gpu)
 
     # Load pretrained model and tokenizer
     config_class, model_class, tokenizer_class = BertConfig, BertForImageCaptioning, BertTokenizer
-    if args.do_train:
-        assert args.model_name_or_path is not None
-        config = config_class.from_pretrained(args.config_name if args.config_name else \
-                args.model_name_or_path, num_labels=args.num_labels, finetuning_task='image_captioning')
-        if args.scst:
-            # avoid using too much memory
-            config.output_hidden_states = True
-        tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name \
-                else args.model_name_or_path, do_lower_case=args.do_lower_case)
-        config.img_feature_dim = args.img_feature_dim
-        config.img_feature_type = args.img_feature_type
-        config.hidden_dropout_prob = args.drop_out
-        config.loss_type = args.loss_type
-        model = model_class.from_pretrained(args.model_name_or_path, 
-                from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
-    else:
-        checkpoint = args.eval_model_dir
-        assert op.isdir(checkpoint)
-        config = config_class.from_pretrained(checkpoint)
-        config.output_hidden_states = args.output_hidden_states
-        tokenizer = tokenizer_class.from_pretrained(checkpoint)
-        logger.info("Evaluate the following checkpoint: %s", checkpoint)
-        model = model_class.from_pretrained(checkpoint, config=config)
+    checkpoint = args.eval_model_dir
+    assert op.isdir(checkpoint)
+    config = config_class.from_pretrained(checkpoint)
+    config.output_hidden_states = args.output_hidden_states
+    tokenizer = tokenizer_class.from_pretrained(checkpoint)
+    logger.info("Evaluate the following checkpoint: %s", checkpoint)
+    model = model_class.from_pretrained(checkpoint, config=config)
 
     model.to(args.device)
-    logger.info("Training/evaluation parameters %s", args)
-    if args.do_train:
-        train_dataset = build_dataset(op.join(args.data_dir, args.train_yaml), tokenizer, args)
-        val_dataset = build_dataset(op.join(args.data_dir, args.val_yaml), 
-                tokenizer, args, is_train=False)
-        global_step, avg_loss = train(args, train_dataset, val_dataset, model, tokenizer)
-        logger.info("Training done: total_step = %s, avg loss = %s", global_step, avg_loss)
 
-    # inference and evaluation
-    if args.do_test or args.do_eval:
-        args = restore_training_settings(args)
-        test_dataset = build_dataset(op.join(args.data_dir, args.test_yaml), 
-                tokenizer, args, is_train=False)
-        if args.n_gpu > 1:
-            model = torch.nn.DataParallel(model)
+    args = restore_training_settings(args)
+    if args.n_gpu > 1:
+        model = torch.nn.DataParallel(model)
 
-        if not args.do_eval:
-            predict_file = get_predict_file(checkpoint, test_dataset.yaml_file, args)
-            test(args, test_dataset, model, tokenizer, predict_file)
-            logger.info("Prediction results saved to: {}".format(predict_file))
-        else:
-            evaluate_file = evaluate(args, test_dataset, model, tokenizer,
-                    checkpoint)
-            logger.info("Evaluation results saved to: {}".format(evaluate_file))
+    img_features, object_ids = extract_oscar_features(IMAGE_PATH, cuda=False if args.no_cuda else True)
+
+    captions = test(args, img_features.to("cpu"), object_ids, model, tokenizer)
+
+    pprint(captions)
+
 
 if __name__ == "__main__":
     main()

@@ -87,7 +87,7 @@ def read_root():
 
 
 @app.post("/oscar/")
-def read_item(image: Image):
+def caption_an_image(image: Image):
     b64string = image.b64string.split("base64,")[-1]
     captions = get_captions(MY_ARGS, b64string, MODEL, TOKENIZER, D2_MODEL)
     return captions

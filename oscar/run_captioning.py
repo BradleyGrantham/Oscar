@@ -4,7 +4,7 @@ from __future__ import absolute_import, division, print_function
 import os
 from io import BytesIO
 from itertools import zip_longest
-import argparse
+from argparse import Namespace
 import base64
 import os.path as op
 import random
@@ -12,7 +12,8 @@ from pprint import pprint
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
+from loguru import logger
 
 from oscar.utils.logger import setup_logger
 from oscar.utils.misc import set_seed
@@ -46,7 +47,10 @@ def convert_image_to_b64(image_path):
 def convert_b64_to_image(s):
     r = base64.b64decode(s)
     file_like = BytesIO(r)
-    im = np.array(Image.open(file_like))
+    im = Image.open(file_like)
+    im = ImageOps.exif_transpose(im)
+    # im.save("/home/ubuntu/image.jpg", "JPEG")
+    im = np.array(im)[:, :, ::-1]
     return im
 
 
@@ -250,7 +254,7 @@ def load_image_ids(img_root):
     return paths_and_ids
 
 
-def build_model(cuda=False):
+def build_d2_model(cuda=False):
     """Build model and load weights for vg only."""
     cfg = get_cfg()  # Renew the cfg file
     cfg.merge_from_file(
@@ -277,12 +281,10 @@ def build_model(cuda=False):
     return detector
 
 
-def extract_oscar_features(image_path, cuda):
-    b = convert_image_to_b64(image_path)
-    image = convert_b64_to_image(b)
-    detector = build_model(cuda)
+def extract_oscar_features(image_string, cuda, d2_model):
+    image = convert_b64_to_image(image_string)
     a, b = create_embeddings(
-        detector, [(image, 0)], cuda
+        d2_model, [(image, 0)], cuda
     )
     return a, b
 
@@ -495,106 +497,14 @@ def restore_training_settings(args):
     return args
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name_or_path", default=None, type=str, required=False,
-                        help="Path to pre-trained model or model type.")
-    parser.add_argument("--loss_type", default='sfmx', type=str,
-                        help="Loss function types: support kl, x2, sfmx")
-    parser.add_argument("--config_name", default="", type=str, 
-                        help="Pretrained config name or path if not the same as model_name.")
-    parser.add_argument("--tokenizer_name", default="", type=str, 
-                        help="Pretrained tokenizer name or path if not the same as model_name.")
-    parser.add_argument("--max_seq_length", default=70, type=int,
-                        help="The maximum total input sequence length after tokenization. "
-                             "Sequences longer than this will be truncated, "
-                             "sequences shorter will be padded.")
-    parser.add_argument("--max_seq_a_length", default=40, type=int, 
-                        help="The maximum sequence length for caption.")
-    parser.add_argument("--do_train", action='store_true', help="Whether to run training.")
-    parser.add_argument("--do_test", action='store_true', help="Whether to run inference.")
-    parser.add_argument("--do_eval", action='store_true', help="Whether to run evaluation.")
-    parser.add_argument("--do_lower_case", action='store_true', 
-                        help="Set this flag if you are using an uncased model.")
-    parser.add_argument("--mask_prob", default=0.15, type=float,
-                        help= "Probability to mask input sentence during training.")
-    parser.add_argument("--max_masked_tokens", type=int, default=3,
-                        help="The max number of masked tokens per sentence.")
-    parser.add_argument("--add_od_labels", default=False, action='store_true', 
-                        help="Whether to add object detection labels or not")
-    parser.add_argument("--drop_out", default=0.1, type=float, help="Drop out in BERT.")
-    parser.add_argument("--max_img_seq_length", default=50, type=int, 
-                        help="The maximum total input image sequence length.")
-    parser.add_argument("--img_feature_dim", default=2054, type=int, 
-                        help="The Image Feature Dimension.")
-    parser.add_argument("--img_feature_type", default='frcnn', type=str,
-                        help="Image feature type.")
-    parser.add_argument("--per_gpu_train_batch_size", default=64, type=int, 
-                        help="Batch size per GPU/CPU for training.")
-    parser.add_argument("--per_gpu_eval_batch_size", default=64, type=int, 
-                        help="Batch size per GPU/CPU for evaluation.")
-    parser.add_argument("--output_mode", default='classification', type=str,
-                        help="output mode, support classification or regression.")
-    parser.add_argument("--num_labels", default=2, type=int, 
-                        help="num_labels is 2 for classification and 1 for regression.")
-    parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
-                        help="Number of updates steps to accumulate before backward.")
-    parser.add_argument("--learning_rate", default=3e-5, type=float, help="The initial lr.")
-    parser.add_argument("--weight_decay", default=0.05, type=float, help="Weight deay.")
-    parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam.")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--warmup_steps", default=0, type=int, help="Linear warmup.")
-    parser.add_argument("--scheduler", default='linear', type=str, help="constant or linear or")
-    parser.add_argument("--num_workers", default=4, type=int, help="Workers in dataloader.")
-    parser.add_argument("--num_train_epochs", default=40, type=int, 
-                        help="Total number of training epochs to perform.")
-    parser.add_argument("--max_steps", default=-1, type=int, 
-                        help="Total number of training steps. Override num_train_epochs.")
-    parser.add_argument('--logging_steps', type=int, default=20, help="Log every X steps.")
-    parser.add_argument('--save_steps', type=int, default=-1, 
-                        help="Save checkpoint every X steps. Will also perform evaluatin.")
-    parser.add_argument("--evaluate_during_training", action='store_true', 
-                        help="Run evaluation during training at each save_steps.")
-    parser.add_argument("--no_cuda", action='store_true', help="Avoid using CUDA.")
-    parser.add_argument('--seed', type=int, default=88, help="random seed for initialization.")
-    parser.add_argument('--scst', action='store_true', help='Self-critical sequence training')
-    # for generation
-    parser.add_argument("--eval_model_dir", type=str, default='', 
-                        help="Model directory for evaluation.")
-    parser.add_argument('--max_gen_length', type=int, default=20,
-                        help="max length of generated sentences")
-    parser.add_argument('--output_hidden_states', action='store_true',
-                        help="Turn on for fast decoding")
-    parser.add_argument('--num_return_sequences', type=int, default=1,
-                        help="repeating times per image")
-    parser.add_argument('--num_beams', type=int, default=5, help="beam search width")
-    parser.add_argument('--num_keep_best', type=int, default=1,
-                        help="number of hypotheses to keep in beam search")
-    parser.add_argument('--temperature', type=float, default=1,
-                        help="temperature in softmax for sampling")
-    parser.add_argument('--top_k', type=int, default=0,
-                        help="filter distribution for sampling")
-    parser.add_argument('--top_p', type=float, default=1,
-                        help="filter distribution for sampling")
-    parser.add_argument('--repetition_penalty', type=int, default=1,
-                        help="repetition penalty from CTRL paper (https://arxiv.org/abs/1909.05858)")
-    parser.add_argument('--length_penalty', type=int, default=1,
-                        help="beam search length penalty")
-    # for Constrained Beam Search
-    parser.add_argument('--use_cbs', action='store_true',
-                        help='Use constrained beam search for decoding')
-    parser.add_argument('--min_constraints_to_satisfy', type=int, default=2,
-                        help="minimum number of constraints to satisfy")
-    args = parser.parse_args()
-
-    global logger
-
-    logger = setup_logger("vlpretrain", "/home/ubuntu/", 0)
-
+def load_models(args):
     args.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
     args.n_gpu = torch.cuda.device_count()
 
     logger.warning("Device: %s, n_gpu: %s", args.device, args.n_gpu)
+
+    args.seed = 88
+
     set_seed(args.seed, args.n_gpu)
 
     # Load pretrained model and tokenizer
@@ -610,15 +520,75 @@ def main():
     model.to(args.device)
 
     args = restore_training_settings(args)
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
 
-    img_features, object_ids = extract_oscar_features(IMAGE_PATH, cuda=False if args.no_cuda else True)
+    return args, model, tokenizer
 
-    captions = test(args, img_features.to("cpu"), object_ids, model, tokenizer)
+
+def get_captions(args, image_string, model_, tokenizer_, d2_model):
+
+    img_features, object_ids = extract_oscar_features(image_string, cuda=False if args.no_cuda else True, d2_model=d2_model)
+
+    captions = test(args, img_features.to("cpu"), object_ids, model_, tokenizer_)
 
     pprint(captions)
+    return captions
 
 
 if __name__ == "__main__":
-    main()
+    my_args = Namespace(
+        model_name_or_path="/home/ubuntu/Oscar/models/checkpoint-29-66420/",
+        loss_type="sfmx",
+        config_name="",
+        tokenizer_name="",
+        max_seq_length=70,
+        max_seq_a_length=40,
+        do_train=False,
+        do_test=True,
+        do_eval=True,
+        do_lower_case=True,
+        mask_prob=0.15,
+        max_masked_tokens=3,
+        add_od_labels=True,
+        drop_out=0.1,
+        max_img_seq_length=50,
+        img_feature_dim=2054,
+        img_feature_type="frcnn",
+        per_gpu_train_batch_size=1,
+        per_gpu_eval_batch_size=1,
+        output_mode="classification",
+        num_labels=2,
+        gradient_accumulation_steps=1,
+        learning_rate=3e-5,
+        weight_decay=0.05,
+        adam_epsilon=1e-8,
+        max_grad_norm=1.0,
+        warmup_steps=0,
+        scheduler="linear",
+        num_workers=4,
+        num_train_epochs=40,
+        max_steps=-1,
+        logging_steps=20,
+        save_steps=-1,
+        evaluate_during_training=False,
+        no_cuda=False,
+        seed=88,
+        scst=False,
+        eval_model_dir="/home/ubuntu/Oscar/models/checkpoint-29-66420/",
+        max_gen_length=20,
+        output_hidden_states=False,
+        num_return_sequences=1,
+        num_beams=5,
+        num_keep_best=8,
+        temperature=1,
+        top_k=0,
+        top_p=1,
+        repetition_penalty=1,
+        length_penalty=1,
+        use_cbs=False,
+        min_constraints_to_satisfy=2
+    )
+
+    my_args, model, tokenizer = load_models(my_args)
+    d2_model = build_d2_model(not my_args.no_cuda)
+    b = convert_image_to_b64(IMAGE_PATH)
+    get_captions(my_args, b, model, tokenizer, d2_model)

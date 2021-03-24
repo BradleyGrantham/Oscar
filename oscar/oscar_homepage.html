@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+    <script src="oscar.js"></script>
+    <meta charset=utf-8 />
+    <title>Oscar</title>
+    <style>
+        article, aside, figure, footer, header, hgroup,
+        menu, nav, section { display: block; }
+        .topleft {
+            position: absolute;
+            top: 8px;
+            left: 16px;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+<input class="topleft" type='file' onchange="readURL(this);" />
+<img id="myimg" src="#" alt="your image" />
+<p id="result"></p>
+</body>
+</html>
